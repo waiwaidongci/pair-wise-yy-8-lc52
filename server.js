@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createReinspection } from "./src/reinspection.js";
+import { listVatStatuses, releaseVat } from "./src/vat-release.js";
+import { createBatch } from "./src/batch-intake.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "paper-pulp-fermentation.json");
@@ -53,7 +56,6 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "PF-" + Date.now(); }
 function computeStats(items) {
   const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
   for (const item of items) {
@@ -92,10 +94,12 @@ function page() {
   <header><div><h1>古法纸浆发酵记录</h1><div class="meta">纸浆批次、浸泡缸、换水和异常观察</div></div><button id="reload">刷新</button></header>
   <main>
     <section>
-      <form id="createForm"><h2>新增纸浆批次</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存纸浆批次</button></form>
+      <form id="createForm"><h2>新增纸浆批次（建档入口）</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存纸浆批次</button><div class="meta" id="createMsg" style="margin-top:8px"></div></form>
+      <form id="reinspectionForm" style="margin-top:14px"><h2>缸位复检放行单</h2><label>浸泡缸</label><input name="vat" list="vatList" required><datalist id="vatList"></datalist><label>冲洗遍数（不少于3遍合格）</label><input name="rinse" type="number" min="0" required><label>残水酸碱度 pH（6.0-8.0 合格）</label><input name="ph" type="number" step="0.1" required><label>霉点</label><select name="mold"><option>无</option><option>有</option></select><label>复检人</label><input name="inspector"><button>提交复检</button><div class="meta" id="reinspectionMsg" style="margin-top:8px"></div></form>
       <form id="actionForm" style="margin-top:14px"><h2>每日观察记录</h2><label>选择纸浆批次</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
     </section>
     <section>
+      <div class="panel" style="margin-bottom:14px"><h2>缸位放行（三项复检通过才可用，放行超过半天未投料需重新复检）</h2><div class="grid" id="vats"></div><div class="logs meta" id="reinspectionLogs" style="margin-top:10px;max-height:120px"></div></div>
       <div class="stats" id="stats"></div>
       <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
       <div class="panel"><h2>每天记录温度、气味、纤维状态和换水情况，系统统计发酵进度与异常次数。</h2><div class="grid" id="cards"></div></div>
@@ -107,19 +111,41 @@ function page() {
     const extraFields = [["temperature","温度"],["smell","气味状态"],["fiber","纤维松散度"],["changedWater","是否换水"],["abnormal","异味或霉点"]];
     const createForm = document.querySelector('#createForm');
     const actionForm = document.querySelector('#actionForm');
+    const reinspectionForm = document.querySelector('#reinspectionForm');
     const cards = document.querySelector('#cards');
     const statsEl = document.querySelector('#stats');
     const itemSelect = document.querySelector('#itemSelect');
     let items = [];
+    let vats = [];
+    let reinspections = [];
     async function api(path, options) {
       const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
+      if (!res.ok) { const err = new Error(data.error || '请求失败'); err.data = data; throw err; }
       return data;
     }
     function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
+      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => key === 'vat'
+        ? '<label>'+label+'</label><select name="vat" id="createVat"></select>'
+        : '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
       document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
+    }
+    function vatHtml(v) {
+      const insp = v.inspection ? '<div class="meta">最近复检：冲洗'+v.inspection.rinse+'遍 · pH '+v.inspection.ph+' · 霉点'+v.inspection.mold+'</div>' : '';
+      const pass = v.released ? '<div>复检通过，半天内投料有效</div><div class="meta">放行截止 '+new Date(v.expiresAt).toLocaleString()+'</div>' : '';
+      const fails = (v.failures || []).map(f => '<div class="warn">✗ '+f+'</div>').join('');
+      return '<article class="card"><h3>'+v.vat+'</h3><span class="pill">'+v.state+'</span>'+insp+pass+fails+'</article>';
+    }
+    function renderVats() {
+      document.querySelector('#vats').innerHTML = vats.map(vatHtml).join('') || '<div class="meta">暂无缸位</div>';
+      const createVat = document.querySelector('#createVat');
+      const current = createVat.value;
+      createVat.innerHTML = vats.map(v => '<option value="'+v.vat+'">'+v.vat+'（'+v.state+'）</option>').join('');
+      createVat.value = current;
+      document.querySelector('#vatList').innerHTML = vats.map(v => '<option value="'+v.vat+'">').join('');
+      document.querySelector('#reinspectionLogs').innerHTML = reinspections.slice(0,6).map(r =>
+        '<div>'+r.at.slice(0,16).replace('T',' ')+' · '+r.vat+' · 冲洗'+r.rinse+'遍 · pH '+r.ph+' · 霉点'+r.mold+' · '+(r.passed ? '通过放行' : '未过：'+r.failures.join('；'))+'</div>'
+      ).join('') || '暂无复检记录';
     }
     function render() {
       itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
@@ -129,6 +155,7 @@ function page() {
       const q = document.querySelector('#search').value.trim();
       const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
       cards.innerHTML = visible.map(item => cardHtml(item)).join('');
+      renderVats();
       document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
       document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
     }
@@ -138,8 +165,35 @@ function page() {
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
       return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
+    async function load() {
+      const [its, vs, rs] = await Promise.all([api('/api/items'), api('/api/vats'), api('/api/reinspections')]);
+      items = its; vats = vs; reinspections = rs;
+      render();
+    }
+    createForm.onsubmit = async event => {
+      event.preventDefault();
+      const msg = document.querySelector('#createMsg');
+      msg.className = 'meta'; msg.textContent = '';
+      try {
+        await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) });
+        createForm.reset();
+        msg.textContent = '建档成功，缸位放行已被本次投料占用';
+      } catch (err) {
+        const failures = err.data && err.data.failures ? err.data.failures : [err.message];
+        msg.className = 'warn';
+        msg.innerHTML = '缸位未放行，原批次内容照旧保留：<br>' + failures.map(f => '✗ ' + f).join('<br>');
+      }
+      await load();
+    };
+    reinspectionForm.onsubmit = async event => {
+      event.preventDefault();
+      const msg = document.querySelector('#reinspectionMsg');
+      const { record } = await api('/api/reinspections', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(reinspectionForm).entries())) });
+      msg.className = record.passed ? 'meta' : 'warn';
+      msg.innerHTML = record.passed ? '三项复检全部通过，缸位已放行（半天内投料有效）' : '复检未过：<br>' + record.failures.map(f => '✗ ' + f).join('<br>');
+      reinspectionForm.reset();
+      await load();
+    };
     actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
     renderForms(); load();
@@ -154,13 +208,22 @@ const server = http.createServer(async (req, res) => {
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/api/reinspections") return send(res, 200, db.reinspections || []);
+    if (req.method === "GET" && url.pathname === "/api/vats") return send(res, 200, listVatStatuses(db));
+    if (req.method === "POST" && url.pathname === "/api/reinspections") {
+      const input = await body(req);
+      if (!String(input.vat || "").trim()) return send(res, 400, { error: "vat_required" });
+      const record = createReinspection(db, input);
+      const release = record.passed ? releaseVat(db, record) : null;
+      await saveDb(db);
+      return send(res, 201, { record, release });
+    }
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建纸浆批次" }] };
-      
-      db.items.unshift(item);
+      const result = createBatch(db, input);
+      if (!result.ok) return send(res, result.status, { error: result.error, vat: result.vat, failures: result.failures });
       await saveDb(db);
-      return send(res, 201, item);
+      return send(res, 201, result.item);
     }
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
