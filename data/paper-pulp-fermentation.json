@@ -4,6 +4,7 @@
       "code": "PF-001",
       "source": "构树皮",
       "vat": "三号缸",
+      "vatId": "vat-3",
       "days": 6,
       "owner": "林素",
       "status": "发酵中",
@@ -31,5 +32,23 @@
         }
       ]
     }
-  ]
+  ],
+  "vats": [
+    {
+      "id": "vat-1",
+      "name": "一号缸",
+      "location": "东一排"
+    },
+    {
+      "id": "vat-2",
+      "name": "二号缸",
+      "location": "东一排"
+    },
+    {
+      "id": "vat-3",
+      "name": "三号缸",
+      "location": "东二排"
+    }
+  ],
+  "inspections": []
 }
